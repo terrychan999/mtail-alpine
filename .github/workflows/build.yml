@@ -1,0 +1,170 @@
+name: Build mtail Alpine
+
+on:
+  schedule:
+    - cron: "12 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mtail-alpine-publish
+  cancel-in-progress: false
+
+env:
+  ALPINE_VERSION: ${{ vars.ALPINE_VERSION || '3.24' }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve inputs and check for changes
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          digest_of() {
+            docker buildx imagetools inspect \
+              --format '{{.Manifest.Digest}}' "$1"
+          }
+
+          upstream=ghcr.io/jaqx0r/mtail
+          alpine_repo=docker.io/library/alpine
+          dest="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mtail-alpine"
+
+          release=$(gh api repos/jaqx0r/mtail/releases/latest --jq '.tag_name')
+          version=${release#v}
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected mtail release tag: $release"
+            exit 1
+          fi
+
+          if [[ ! "$ALPINE_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Expected ALPINE_VERSION in major.minor or major.minor.patch format"
+            exit 1
+          fi
+
+          declare -A upstream_digest
+          for arch in amd64 arm64; do
+            ref="${upstream}:${version}-${arch}"
+            if ! result=$(digest_of "$ref" 2>&1); then
+              if grep -Eiq 'manifest unknown|manifest_unknown|not found|404' <<< "$result"; then
+                echo "::notice::Upstream image not available yet: $ref"
+                exit 0
+              fi
+              printf '%s\n' "$result" >&2
+              exit 1
+            fi
+            upstream_digest[$arch]=$result
+          done
+
+          alpine_digest=$(digest_of "${alpine_repo}:${ALPINE_VERSION}")
+          dockerfile_hash=$(sha256sum Dockerfile | cut -d ' ' -f 1)
+
+          fingerprint=$(printf '%s\n' \
+            "$version" "${upstream_digest[amd64]}" "${upstream_digest[arm64]}" \
+            "$ALPINE_VERSION" "$alpine_digest" "$dockerfile_hash" \
+            | sha256sum | cut -d ' ' -f 1)
+
+          version_tag="${dest}:${version}-alpine${ALPINE_VERSION}"
+          existing=""
+
+          if version_digest=$(digest_of "$version_tag" 2>/dev/null); then
+            amd64_manifest=$(docker buildx imagetools inspect --raw "${dest}@${version_digest}" \
+              | jq -r '[.manifests[]? | select(.platform.os == "linux" and .platform.architecture == "amd64")][0].digest // empty')
+
+            if [[ -n "$amd64_manifest" ]]; then
+              existing=$(docker buildx imagetools inspect \
+                --format '{{json .Image}}' "${dest}@${amd64_manifest}" \
+                | jq -r '.config.Labels["io.github.mtail-alpine.inputs"] // empty')
+            fi
+          fi
+
+          if [[ "$existing" == "$fingerprint" ]]; then
+            latest_digest=$(digest_of "${dest}:latest" 2>/dev/null || true)
+            if [[ "$latest_digest" != "$version_digest" ]]; then
+              docker buildx imagetools create \
+                --tag "${dest}:latest" "${dest}@${version_digest}"
+            fi
+            echo "Inputs unchanged; skipping build."
+            exit 0
+          fi
+
+          {
+            echo "build=true"
+            echo "dest=$dest"
+            echo "version_tag=$version_tag"
+            echo "amd64=${upstream}@${upstream_digest[amd64]}"
+            echo "arm64=${upstream}@${upstream_digest[arm64]}"
+            echo "alpine_image=${alpine_repo}@${alpine_digest}"
+            echo "fingerprint=$fingerprint"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.resolve.outputs.build == 'true'
+
+      - name: Build, smoke-test, and publish
+        if: steps.resolve.outputs.build == 'true'
+        env:
+          DEST: ${{ steps.resolve.outputs.dest }}
+          VERSION_TAG: ${{ steps.resolve.outputs.version_tag }}
+          MTAIL_AMD64: ${{ steps.resolve.outputs.amd64 }}
+          MTAIL_ARM64: ${{ steps.resolve.outputs.arm64 }}
+          ALPINE_IMAGE: ${{ steps.resolve.outputs.alpine_image }}
+          FINGERPRINT: ${{ steps.resolve.outputs.fingerprint }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          declare -A staging_tags
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64) source="$MTAIL_AMD64" ;;
+              arm64) source="$MTAIL_ARM64" ;;
+            esac
+
+            staging="${DEST}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
+            staging_tags[$arch]=$staging
+
+            docker buildx build \
+              --platform "linux/${arch}" \
+              --build-arg "MTAIL_IMAGE=${source}" \
+              --build-arg "ALPINE_IMAGE=${ALPINE_IMAGE}" \
+              --label "io.github.mtail-alpine.inputs=${FINGERPRINT}" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --tag "$staging" \
+              --load .
+
+            docker run --rm --platform "linux/${arch}" "$staging" -version
+          done
+
+          sources=()
+          for arch in amd64 arm64; do
+            staging=${staging_tags[$arch]}
+            docker push "$staging"
+            digest=$(docker buildx imagetools inspect \
+              --format '{{.Manifest.Digest}}' "$staging")
+            sources+=("${DEST}@${digest}")
+          done
+
+          docker buildx imagetools create \
+            --tag "$VERSION_TAG" \
+            --tag "${DEST}:latest" \
+            "${sources[@]}"
