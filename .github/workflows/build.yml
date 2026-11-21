@@ -169,37 +169,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          declare -A staging_tags
+          sources=()
+
           for arch in amd64 arm64; do
             case "$arch" in
               amd64) source="$MTAIL_AMD64" ;;
               arm64) source="$MTAIL_ARM64" ;;
             esac
 
-            staging="${DEST}:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${arch}"
-            staging_tags[$arch]=$staging
+            image="mtail-alpine:test-${arch}"
+            metadata="${RUNNER_TEMP}/mtail-${arch}.json"
 
+            build_args=(
+              --platform "linux/${arch}"
+              --build-arg "MTAIL_IMAGE=${source}"
+              --build-arg "ALPINE_IMAGE=${ALPINE_IMAGE}"
+              --label "io.github.mtail-alpine.inputs=${FINGERPRINT}"
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+            )
+
+            # Build locally and run smoke tests
             docker buildx build \
-              --platform "linux/${arch}" \
-              --build-arg "MTAIL_IMAGE=${source}" \
-              --build-arg "ALPINE_IMAGE=${ALPINE_IMAGE}" \
-              --label "io.github.mtail-alpine.inputs=${FINGERPRINT}" \
-              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-              --tag "$staging" \
+              "${build_args[@]}" \
+              --tag "$image" \
               --load .
 
-            docker run --rm --platform "linux/${arch}" "$staging" -version
-          done
+            docker run --rm --platform "linux/${arch}" "$image" -version
 
-          sources=()
-          for arch in amd64 arm64; do
-            staging=${staging_tags[$arch]}
-            docker push "$staging"
-            digest=$(docker buildx imagetools inspect \
-              --format '{{.Manifest.Digest}}' "$staging")
+            # Push by digest without creating staging tags
+            docker buildx build \
+              "${build_args[@]}" \
+              --output "type=image,name=${DEST},push=true,push-by-digest=true,name-canonical=true" \
+              --metadata-file "$metadata" .
+
+            digest=$(jq -er '."containerimage.digest"' "$metadata")
             sources+=("${DEST}@${digest}")
           done
 
+          # Publish the multi-platform image
           docker buildx imagetools create \
             --tag "$VERSION_TAG" \
             --tag "${DEST}:latest" \
