@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ALPINE_VERSION: ${{ vars.ALPINE_VERSION || '3.24' }}
+  ALPINE_VERSION: ${{ vars.ALPINE_VERSION || 'auto' }}
 
 jobs:
   publish:
@@ -58,6 +58,20 @@ jobs:
           release=$(gh api repos/jaqx0r/mtail/releases/latest --jq '.tag_name')
           version=${release#v}
 
+          if [[ "$ALPINE_VERSION" == "auto" ]]; then
+            alpine_release=$(curl -fsSL --retry 3 https://alpinelinux.org/releases.json \
+              | jq -er '.latest_stable | sub("^v"; "")')
+
+            if [[ ! "$alpine_release" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
+              echo "::error::Unexpected Alpine release: $alpine_release"
+              exit 1
+            fi
+
+            ALPINE_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+          fi
+
+          echo "Alpine version: $ALPINE_VERSION"
+
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Unexpected mtail release tag: $release"
             exit 1
@@ -87,7 +101,18 @@ jobs:
             upstream_digest[$arch]=$result
           done
 
-          alpine_digest=$(digest_of "${alpine_repo}:${ALPINE_VERSION}")
+          alpine_ref="${alpine_repo}:${ALPINE_VERSION}"
+
+          if ! alpine_digest=$(digest_of "$alpine_ref" 2>&1); then
+            if grep -Eiq 'manifest unknown|manifest_unknown|not found|404' <<< "$alpine_digest"; then
+              echo "::warning::Alpine image not available yet: $alpine_ref"
+              exit 0
+            fi
+
+            printf '%s\n' "$alpine_digest" >&2
+            exit 1
+          fi
+
           dockerfile_hash=$(sha256sum Dockerfile | cut -d ' ' -f 1)
           workflow_hash=$(sha256sum .github/workflows/build.yml | cut -d ' ' -f 1)
 
